@@ -28,6 +28,10 @@ extern "C" void schedule_dump(const char* prefix);
 #include "diskann/pq_flash_aisaq_index.h"
 #include "exact_rerank.h"
 
+unsigned schedule_setup(const char* prefix, unsigned width);
+void compact_search(const float* query, size_t k, size_t limit, int64_t* ids, float* distances,
+                    diskann::QueryStats& stats);
+
 // The packaged Knowhere engine owns the implementation and worker pools.
 namespace knowhere {
 void InitBuildThreadPool(uint32_t num_threads);
@@ -36,7 +40,7 @@ void InitBuildThreadPool(uint32_t num_threads);
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr uint32_t top_k = 10;
-const uint32_t search_threads = option_u64("ANN_THREADS", 4);
+
 constexpr uint64_t gib = uint64_t{1} << 30;
 
 struct Shape {
@@ -128,26 +132,27 @@ int search(int argc, char** argv) {
         argc > 6 ? std::stoull(argv[6]) : 0,
     };
     const auto rss_before_load = rss_kib();
-    if (!AioContextPool::InitGlobalAioPool(search_threads, std::min<size_t>(default_max_events, 64))) {
-        throw std::runtime_error("Could not configure the Linux AIO context pool");
-    }
-    auto reader = std::make_shared<LinuxAlignedFileReader>();
-    auto index = std::make_unique<diskann::PQFlashAisaqIndex<float>>(reader, diskann::Metric::L2);
-    if (index->aisaq_load(search_threads, argv[3]) != 0) {
-        throw std::runtime_error("AiSAQ index load failed");
-    }
-    if (index->get_data_dim() != shape.dim || shape.dim != 1024) {
-        throw std::runtime_error("BGE search requires matching 1024-dimensional queries and graph");
-    }
-    if (!index->get_rearranged_index()) {
-        config.pq_read_page_cache_size = 0;
-    }
-    if (config.pq_cache_size > 0) {
-        index->aisaq_load_pq_cache(std::string(argv[3]) + "_pq_compressed.bin", config.pq_cache_size,
-                                   diskann::aisaq_pq_cache_policy_auto);
-    }
-    if (index->aisaq_init(config.pq_io_engine, argv[3]) != 0) {
-        throw std::runtime_error("AiSAQ PQ reader initialization failed");
+    const unsigned search_threads = bounded_width("ANN_THREADS", 4);
+    const unsigned window_width = bounded_width("ANN_WIDTH", 2);
+    if (shape.dim != 1024) throw std::runtime_error("BGE search requires 1024-dimensional queries");
+    const unsigned packed_width = schedule_setup(argv[3], window_width);
+    std::unique_ptr<diskann::PQFlashAisaqIndex<float>> index;
+    if (packed_width) {
+        if (config.pq_cache_size || config.pq_read_page_cache_size)
+            throw std::runtime_error("compact graph only uses inline PQ and the shared hot cache");
+    } else {
+        if (!AioContextPool::InitGlobalAioPool(search_threads, std::min<size_t>(default_max_events, 64)))
+            throw std::runtime_error("Could not configure the native AIO pool");
+        auto reader = std::make_shared<LinuxAlignedFileReader>();
+        index = std::make_unique<diskann::PQFlashAisaqIndex<float>>(reader, diskann::Metric::L2);
+        if (index->aisaq_load(search_threads, argv[3]) != 0 || index->get_data_dim() != shape.dim)
+            throw std::runtime_error("AiSAQ load failed or dimensions differ");
+        if (!index->get_rearranged_index()) config.pq_read_page_cache_size = 0;
+        if (config.pq_cache_size)
+            index->aisaq_load_pq_cache(std::string(argv[3]) + "_pq_compressed.bin", config.pq_cache_size,
+                                       diskann::aisaq_pq_cache_policy_auto);
+        if (index->aisaq_init(config.pq_io_engine, argv[3]) != 0)
+            throw std::runtime_error("AiSAQ PQ reader initialization failed");
     }
     const auto rss_after_load = rss_kib();
 
@@ -157,25 +162,28 @@ int search(int argc, char** argv) {
     std::vector<double> wall_us(shape.rows);
     std::vector<std::array<double, 12>> counters(shape.rows);
     std::exception_ptr failure;
-    const uint32_t cap = option_u64("RR_C", 0);
-    const uint32_t width = option_u64("RR_WIDTH", 2);
-    if (cap && (cap < top_k || cap > depth || shape.dim != 1024))
-        throw std::runtime_error("Rerank requires 10<=RR_C<=L and 1024-dimensional BGE");
+    const size_t cap = option_u64("RR_C", 0);
+    const unsigned width = bounded_width("RR_WIDTH", 2);
+    if (cap > depth) throw std::runtime_error("RR_C exceeds L");
     std::vector<std::unique_ptr<ExactReranker>> workers;
     for (size_t t = 0; t < search_threads; ++t)
         workers.emplace_back(new ExactReranker(std::getenv("RR_POOL"), option_u64("RR_OFFSET", 0),
-                                               option_u64("RR_STRIDE", 4096), width, cap));
+                                               option_u64("RR_STRIDE", 0), width, cap));
     std::vector<RerankStats> rerank_stats(shape.rows);
-    const auto window_width = option_u64("ANN_WIDTH", 2);
     auto run_row = [&](uint32_t row, diskann::QueryStats& graph_stats, RerankStats& rr) {
         ExactReranker& worker = *workers.at(omp_get_thread_num());
         const float* query = queries.data() + size_t{row} * shape.dim;
         int64_t* out_ids = ids.data() + size_t{row} * top_k;
         float* out_dist = distances.data() + size_t{row} * top_k;
-        index->aisaq_cached_beam_search(query, cap ? cap : top_k, depth,
-                                        cap ? worker.candidates.data() : out_ids,
-                                        cap ? worker.estimates.data() : out_dist, window_width, false,
-                                        &graph_stats, nullptr, nullptr, -1.0f, &config);
+        const size_t requested = cap ? cap : top_k;
+        auto* candidate_ids = cap ? worker.candidates.data() : out_ids;
+        auto* candidate_dist = cap ? worker.estimates.data() : out_dist;
+        if (packed_width)
+            compact_search(query, requested, depth, candidate_ids, candidate_dist, graph_stats);
+        else
+            index->aisaq_cached_beam_search(query, requested, depth, candidate_ids, candidate_dist,
+                                            window_width, false, &graph_stats, nullptr, nullptr, -1.0f,
+                                            &config);
         if (cap) worker.run(query, out_ids, out_dist, rr);
     };
     const uint32_t warmup = std::min(shape.rows, std::max(32U, 2 * search_threads));
@@ -232,18 +240,19 @@ int search(int argc, char** argv) {
     if (!sample_file) throw std::runtime_error("Could not write scheduler counters");
     std::ofstream csv(output + "_queries.csv");
     csv << "query_row,latency_us,total_us,io_us,cpu_us,io_requests,reads_4k,reads_8k,reads_12k,cache_hits,"
-           "hops,rerank_reads,rerank_batches,rerank_us\n";
+           "hops,rerank_reads,rerank_batches,rerank_us,rerank_bytes,rerank_peak\n";
     uint64_t reported_bytes = 0, rerank_reads = 0, rerank_batches = 0;
     for (uint32_t row = 0; row < shape.rows; ++row) {
         const auto& s = stats[row];
         const auto& rr = rerank_stats[row];
         rerank_reads += rr.reads;
         rerank_batches += rr.batches;
-        reported_bytes += uint64_t{4096} * rr.reads;
+        reported_bytes += rr.bytes;
         reported_bytes += uint64_t{4096} * (s.n_4k + 2 * s.n_8k + 3 * s.n_12k);
         csv << row << ',' << wall_us[row] << ',' << s.total_us << ',' << s.io_us << ',' << s.cpu_us << ','
             << s.n_ios << ',' << s.n_4k << ',' << s.n_8k << ',' << s.n_12k << ',' << s.n_cache_hits << ','
-            << s.n_hops << ',' << rr.reads << ',' << rr.batches << ',' << rr.microseconds << '\n';
+            << s.n_hops << ',' << rr.reads << ',' << rr.batches << ',' << rr.microseconds << ',' << rr.bytes
+            << ',' << rr.peak << '\n';
     }
     std::ofstream id_file(output + "_ids.i64", std::ios::binary);
     id_file.write(reinterpret_cast<const char*>(ids.data()), ids.size() * sizeof(int64_t));
@@ -263,8 +272,9 @@ int search(int argc, char** argv) {
               << " rerank_reads=" << rerank_reads << " rerank_batches=" << rerank_batches
               << " io_bytes=" << reported_bytes << " storage_read_bytes=" << after - before
               << " rss_before_load_kib=" << rss_before_load << " rss_after_load_kib=" << rss_after_load
-              << " rss_after_search_kib=" << rss_kib() << " pq_chunks=" << index->get_n_chunks()
-              << " max_node_len=" << index->get_max_node_len() << '\n';
+              << " rss_after_search_kib=" << rss_kib()
+              << " pq_chunks=" << (index ? index->get_n_chunks() : packed_width)
+              << " max_node_len=" << (index ? index->get_max_node_len() : 4096) << '\n';
     return 0;
 }
 }  // namespace

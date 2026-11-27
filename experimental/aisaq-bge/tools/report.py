@@ -32,11 +32,12 @@ def main():
     delta = counters[1] - counters[0]
     graph_requests = sum(int(row["io_requests"]) for row in queries)
     cache_hits = sum(int(row["cache_hits"]) for row in queries)
-    rerank_reads = sum(int(row["rerank_reads"]) for row in queries)
+    rerank_bytes = sum(int(row["rerank_bytes"]) if "rerank_bytes" in row else
+                       4096 * int(row["rerank_reads"]) for row in queries)
     print(f"Recall@10: {100 * hits / (10 * rows):.2f}%")
     print(f"Hot-cache hits / expanded nodes: {cache_hits}/{graph_requests + cache_hits}")
     print(f"Device KiB/query (includes rerank): {delta[3] * 0.5 / rows:.3f}")
-    print(f"FP32 rerank KiB/query: {rerank_reads * 4 / rows:.3f}")
+    print(f"Rerank direct-read KiB/query: {rerank_bytes / 1024 / rows:.3f}")
 
 
 if __name__ == "__main__":

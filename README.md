@@ -1,3 +1,7 @@
+## ARM64 AiSAQ 实验代码
+
+本仓库保留 Knowhere v2.6.22 的提交历史。BGE-M3-10M 对照使用的搜索、建图格式和精排工具位于 [experimental/aisaq-bge](experimental/aisaq-bge/README.md)。实验通过独立查询程序调用 AiSAQ-full，可以切换批等待和滚动补读，或将完整节点组织为 4 KiB 记录。[实测参数与结果](experimental/aisaq-bge/reference/)
+
 <p>
     <img src="static/knowhere-logo.png" alt="Knowhere Logo"/>
 </p>

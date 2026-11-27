@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 
 
@@ -40,6 +41,7 @@ def main():
             )
             if (rc.returncode == 0) != success:
                 raise AssertionError(f"{cmd}: {rc.returncode}: {rc.stderr[-2000:]}")
+            return rc
 
         rows = 13
         first = 2**32 - 2
@@ -109,19 +111,25 @@ def main():
             [
                 ("wide", first, True, 16, "rolling"),
                 ("last", last_base, True, 16, "rolling"),
-                ("wide", first, False, 3, "batch"),
+                ("wide", first, False, 5, "batch"),
                 ("legacy", 0, False, 16, "batch"),
                 ("converted", 0, True, 16, "rolling"),
             ]
         ):
             out = root / f"r{i}"
-            (root / "hot").write_bytes(struct.pack("<2Q", base, base + 3))
+            width = 8 if base else 4
+            item = "Q" if base else "I"
+            ranking = root / f"ranking{i}"
+            ranking.write_bytes(struct.pack(f"<Q2{item}", 2, base, base + 3))
+            hot_list = root / f"hot{i}"
+            tool = Path(__file__).resolve().parents[1] / "tools" / "hot_ids.py"
+            run(sys.executable, tool, ranking, hot_list, "--layout", "compact", "--id-bytes", width)
             cfg = {
                 "ANN_LAYOUT": "sq64",
                 "ANN_LAYOUT_FILE": str(root / graph),
                 "ANN_LAYOUT_PIVOTS": str(args.pivots),
-                "ANN_HOT_IDS": str(root / "hot") if hot else "",
-                "ANN_HOT_ID_BYTES": "8",
+                "ANN_HOT_IDS": str(hot_list) if hot else "",
+                "ANN_HOT_ID_BYTES": str(width),
                 "ANN_WIDTH": "9",
                 "ANN_THREADS": "1",
                 "ANN_SCHEDULE": mode,
@@ -140,7 +148,7 @@ def main():
             ds = struct.unpack("<10f", Path(str(out) + "_distances.f32").read_bytes())
             expected = sorted(range(rows), key=lambda j: (abs(j - 3.25), j))[: min(cap, 10)]
             assert list(got) == [base + j for j in expected] + [-1] * (10 - len(expected))
-            assert all(math.isinf(v) for v in ds[len(expected) :])
+            assert all(v == math.inf for v in ds[len(expected) :])
             with open(str(out) + "_queries.csv") as f:
                 s = next(csv.DictReader(f))
             with open(str(out) + ".schedule.csv") as f:
@@ -153,6 +161,23 @@ def main():
             if args.expect_half_read:
                 assert read_size == args.expect_half_read
             assert int(sched["submitted"]) == int(sched["reaped"]) and 6 < int(sched["peak_depth"]) <= 9
+        oversized = root / "oversized-hot"
+        for entries in (4081, 65536):
+            with oversized.open("wb") as stream:
+                stream.truncate(entries * 8)
+            rejected = run(
+                args.search,
+                "search",
+                "q",
+                "unused",
+                24,
+                root / "oversized-result",
+                0,
+                0,
+                overrides=cfg | {"ANN_HOT_IDS": str(oversized), "ANN_HOT_ID_BYTES": "8"},
+                success=False,
+            )
+            assert "hot ID list exceeds cache capacity" in rejected.stderr
         if args.large_offset:
             # Only the three reachable test records and header are allocated. These reads exercise
             # the real 64-bit file offset, not just the nonzero logical ID base.

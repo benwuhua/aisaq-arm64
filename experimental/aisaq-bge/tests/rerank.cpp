@@ -30,7 +30,7 @@ int main(int argc, char** argv) try {
     require(std::abs(bge_l2::fp32(query.data(), row.data()) - expected) < expected * 3e-6,
             "FP32 L2 differs from scalar");
     std::fill(query.begin(), query.end(), 0);
-    for (size_t cap : {1, 3, 16}) {
+    for (size_t cap : {1, 3, 5, 16}) {
         ExactReranker rr(argv[1], 0, 0, 4, cap);
         for (size_t n :
              {std::min(cap, size_t(13)), std::min(cap, size_t(2)), size_t(0), cap > 1 ? size_t(1) : cap}) {
@@ -38,6 +38,8 @@ int main(int argc, char** argv) try {
             for (size_t i = 0; i < n; ++i) rr.candidates[i] = 12 - i;
             int64_t ids[10];
             float d[10];
+            std::fill_n(ids, 10, 12345);
+            std::fill_n(d, 10, -7.f);
             RerankStats stats;
             rr.run(query.data(), ids, d, stats);
             require(stats.reads == n && stats.peak <= 4, "rerank submitted invalid reads");
@@ -46,7 +48,7 @@ int main(int argc, char** argv) try {
                     int64_t id = 13 - n + i;
                     require(ids[i] == id && d[i] == 1024.f * id * id, "incorrect valid candidate");
                 } else
-                    require(ids[i] == -1 && std::isinf(d[i]), "stale candidate leaked");
+                    require(ids[i] == -1 && d[i] == std::numeric_limits<float>::infinity(), "stale candidate leaked");
             }
         }
     }
